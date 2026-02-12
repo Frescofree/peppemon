@@ -1,0 +1,21 @@
+[package]
+name = "peppemon"
+version = "0.2.0"
+edition = "2021"
+description = "Real-time system performance monitor"
+authors = ["peppe"]
+license = "MIT"
+repository = "https://github.com/peppe/peppemon"
+keywords = ["tui", "system-monitor", "terminal", "performance"]
+categories = ["command-line-utilities"]
+readme = "README.md"
+
+[dependencies]
+ratatui = "0.29"
+crossterm = "0.28"
+sysinfo = "0.33"
+
+[profile.release]
+opt-level = 3
+lto = true
+strip = true
