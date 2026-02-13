@@ -977,7 +977,8 @@ fn render_clock(frame: &mut Frame) {
 
     let ox = (area.width - total_w) / 2;
     let oy = (area.height - total_h) / 2;
-    let color = Color::Rgb(50, 50, 65);
+    let fg_color = Color::Rgb(90, 90, 115);
+    let bg_color = Color::Rgb(30, 30, 45);
 
     for (gi, &idx) in digits.iter().enumerate() {
         // Skip colon when it should be invisible (blink off)
@@ -1003,7 +1004,10 @@ fn render_clock(frame: &mut Frame) {
                             if let Some(cell) = buf.cell_mut((x, y)) {
                                 if cell.symbol() == " " {
                                     cell.set_symbol("█");
-                                    cell.set_fg(color);
+                                    cell.set_fg(fg_color);
+                                } else {
+                                    // Glow behind existing widget text
+                                    cell.set_bg(bg_color);
                                 }
                             }
                         }
