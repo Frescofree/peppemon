@@ -16,12 +16,35 @@ use std::{
     collections::VecDeque,
     fs,
     io::{self, stdout},
-    time::{Duration, Instant},
+    time::{Duration, Instant, SystemTime},
 };
 use sysinfo::{CpuRefreshKind, MemoryRefreshKind, ProcessRefreshKind, RefreshKind, System};
 
 const HISTORY_LEN: usize = 60;
 const TICK_RATE: Duration = Duration::from_millis(1000);
+const ANIM_TICK: Duration = Duration::from_millis(100);
+const MAX_PARTICLES: usize = 100;
+const CYCLE_DURATION: Duration = Duration::from_secs(45);
+const LIGHTNING_FLASH_FRAMES: u8 = 3;
+const LIGHTNING_MIN_INTERVAL_SECS: u64 = 3;
+const LIGHTNING_MAX_INTERVAL_SECS: u64 = 8;
+
+// 3-column bitmask font for clock digits (0-9) + colon.
+// Each glyph is 5 rows; bits 2,1,0 = left, center, right columns.
+// Rendered doubled ("██" per pixel) → 6 chars wide × 5 rows per glyph.
+const CLOCK_GLYPHS: [[u8; 5]; 11] = [
+    [0b111, 0b101, 0b101, 0b101, 0b111], // 0
+    [0b010, 0b110, 0b010, 0b010, 0b111], // 1
+    [0b111, 0b001, 0b111, 0b100, 0b111], // 2
+    [0b111, 0b001, 0b111, 0b001, 0b111], // 3
+    [0b101, 0b101, 0b111, 0b001, 0b001], // 4
+    [0b111, 0b100, 0b111, 0b001, 0b111], // 5
+    [0b111, 0b100, 0b111, 0b101, 0b111], // 6
+    [0b111, 0b001, 0b001, 0b001, 0b001], // 7
+    [0b111, 0b101, 0b111, 0b101, 0b111], // 8
+    [0b111, 0b101, 0b111, 0b001, 0b111], // 9
+    [0b000, 0b010, 0b000, 0b010, 0b000], // : (colon)
+];
 
 // ── Enums ──────────────────────────────────────────────────────────────────
 
@@ -37,6 +60,102 @@ enum SortMode {
     Cpu,
     Memory,
     Pid,
+}
+
+#[derive(Clone, Copy, PartialEq)]
+enum WeatherEffect {
+    Rain,
+    Snow,
+    Lightning,
+    Seasons,
+}
+
+#[derive(Clone, Copy, PartialEq)]
+enum CycleMode {
+    Auto,
+    Pinned,
+}
+
+#[derive(Clone, Copy, PartialEq)]
+enum SeasonMode {
+    AutoRotate,
+    RealSeason,
+    NatureBlend,
+}
+
+#[derive(Clone, Copy, PartialEq)]
+enum Season {
+    Spring,
+    Summer,
+    Autumn,
+    Winter,
+}
+
+#[derive(Clone, Copy, PartialEq)]
+enum SettingsRow {
+    Effect,
+    CycleMode,
+    SeasonMode,
+    Intensity,
+    Speed,
+}
+
+impl SettingsRow {
+    fn next(self) -> Self {
+        match self {
+            Self::Effect => Self::CycleMode,
+            Self::CycleMode => Self::SeasonMode,
+            Self::SeasonMode => Self::Intensity,
+            Self::Intensity => Self::Speed,
+            Self::Speed => Self::Effect,
+        }
+    }
+    fn prev(self) -> Self {
+        match self {
+            Self::Effect => Self::Speed,
+            Self::CycleMode => Self::Effect,
+            Self::SeasonMode => Self::CycleMode,
+            Self::Intensity => Self::SeasonMode,
+            Self::Speed => Self::Intensity,
+        }
+    }
+}
+
+// ── Particle system ───────────────────────────────────────────────────────
+
+struct Particle {
+    x: f32,
+    y: f32,
+    symbol: &'static str,
+    fg: Color,
+    speed_y: f32,
+    drift_x: f32,
+    life: u16,
+}
+
+struct LightningState {
+    active: bool,
+    frames_remaining: u8,
+    bolt_segments: Vec<(u16, u16)>,
+    next_strike: Duration,
+    timer: Instant,
+}
+
+struct ParticleSystem {
+    particles: Vec<Particle>,
+    rng: fastrand::Rng,
+    effect: WeatherEffect,
+    cycle_mode: CycleMode,
+    season_mode: SeasonMode,
+    intensity: u8,
+    speed: u8,
+    current_season: Season,
+    season_timer: Instant,
+    cycle_timer: Instant,
+    lightning: LightningState,
+    enabled: bool,
+    frame_count: u32,
+    transition_cooldown: u8,
 }
 
 // ── Snapshots ──────────────────────────────────────────────────────────────
@@ -79,6 +198,10 @@ struct App {
     show_help: bool,
     cpu_temp: Option<f64>,
     cpu_freq_avg: Option<f64>,
+    // v0.3 background effects
+    show_settings: bool,
+    settings_row: SettingsRow,
+    particles: ParticleSystem,
 }
 
 impl App {
@@ -133,6 +256,9 @@ impl App {
             show_help: false,
             cpu_temp: None,
             cpu_freq_avg: None,
+            show_settings: false,
+            settings_row: SettingsRow::Effect,
+            particles: ParticleSystem::new(),
         }
     }
 
@@ -229,7 +355,9 @@ impl App {
 }
 
 // ── Sensor readers ─────────────────────────────────────────────────────────
+// Linux-primary with cross-platform fallbacks
 
+#[cfg(target_os = "linux")]
 fn read_net_bytes() -> (u64, u64) {
     let mut rx_total = 0u64;
     let mut tx_total = 0u64;
@@ -252,6 +380,13 @@ fn read_net_bytes() -> (u64, u64) {
     (rx_total, tx_total)
 }
 
+#[cfg(not(target_os = "linux"))]
+fn read_net_bytes() -> (u64, u64) {
+    // sysinfo Networks could be used here; for now return zero (rates will show 0)
+    (0, 0)
+}
+
+#[cfg(target_os = "linux")]
 fn read_disk_bytes() -> (u64, u64) {
     let mut read_total = 0u64;
     let mut write_total = 0u64;
@@ -283,7 +418,13 @@ fn read_disk_bytes() -> (u64, u64) {
     (read_total, write_total)
 }
 
+#[cfg(not(target_os = "linux"))]
+fn read_disk_bytes() -> (u64, u64) {
+    (0, 0)
+}
+
 /// Try hwmon (k10temp / coretemp), fall back to thermal_zone0
+#[cfg(target_os = "linux")]
 fn read_cpu_temp() -> Option<f64> {
     if let Ok(entries) = fs::read_dir("/sys/class/hwmon") {
         for entry in entries.flatten() {
@@ -308,7 +449,14 @@ fn read_cpu_temp() -> Option<f64> {
     None
 }
 
+#[cfg(not(target_os = "linux"))]
+fn read_cpu_temp() -> Option<f64> {
+    // No cross-platform temp reader without sysinfo Components; return None
+    None
+}
+
 /// Average of all cores' scaling_cur_freq (kHz → MHz)
+#[cfg(target_os = "linux")]
 fn read_cpu_freq() -> Option<f64> {
     let mut total = 0u64;
     let mut count = 0u32;
@@ -337,8 +485,14 @@ fn read_cpu_freq() -> Option<f64> {
     }
 }
 
+#[cfg(not(target_os = "linux"))]
+fn read_cpu_freq() -> Option<f64> {
+    None
+}
+
 fn read_system_info() -> Vec<(String, String)> {
     let mut info = Vec::new();
+    // Cross-platform via sysinfo
     info.push((
         "Kernel".into(),
         System::kernel_version().unwrap_or_default(),
@@ -350,34 +504,406 @@ fn read_system_info() -> Vec<(String, String)> {
     let mins = (uptime % 3600) / 60;
     info.push(("Uptime".into(), format!("{}h {}m", hours, mins)));
 
-    if let Ok(gov) = fs::read_to_string("/sys/devices/system/cpu/cpu0/cpufreq/scaling_governor") {
-        info.push(("Governor".into(), gov.trim().to_string()));
-    }
-    if let Ok(s) = fs::read_to_string("/proc/sys/vm/swappiness") {
-        info.push(("Swappiness".into(), s.trim().to_string()));
-    }
-    if let Ok(cc) = fs::read_to_string("/proc/sys/net/ipv4/tcp_congestion_control") {
-        info.push(("TCP CC".into(), cc.trim().to_string()));
-    }
-    if let Ok(la) = fs::read_to_string("/proc/loadavg") {
-        let parts: Vec<&str> = la.split_whitespace().collect();
-        if parts.len() >= 3 {
-            info.push((
-                "Load".into(),
-                format!("{} {} {}", parts[0], parts[1], parts[2]),
-            ));
+    // Linux-specific extras (silently skipped on other OSes)
+    #[cfg(target_os = "linux")]
+    {
+        if let Ok(gov) =
+            fs::read_to_string("/sys/devices/system/cpu/cpu0/cpufreq/scaling_governor")
+        {
+            info.push(("Governor".into(), gov.trim().to_string()));
         }
-    }
-    if let Ok(stat) = fs::read_to_string("/proc/stat") {
-        for line in stat.lines() {
-            if let Some(rest) = line.strip_prefix("ctxt ") {
-                let val: u64 = rest.trim().parse().unwrap_or(0);
-                info.push(("Ctx Sw".into(), format!("{}", val)));
-                break;
+        if let Ok(s) = fs::read_to_string("/proc/sys/vm/swappiness") {
+            info.push(("Swappiness".into(), s.trim().to_string()));
+        }
+        if let Ok(cc) = fs::read_to_string("/proc/sys/net/ipv4/tcp_congestion_control") {
+            info.push(("TCP CC".into(), cc.trim().to_string()));
+        }
+        if let Ok(la) = fs::read_to_string("/proc/loadavg") {
+            let parts: Vec<&str> = la.split_whitespace().collect();
+            if parts.len() >= 3 {
+                info.push((
+                    "Load".into(),
+                    format!("{} {} {}", parts[0], parts[1], parts[2]),
+                ));
+            }
+        }
+        if let Ok(stat) = fs::read_to_string("/proc/stat") {
+            for line in stat.lines() {
+                if let Some(rest) = line.strip_prefix("ctxt ") {
+                    let val: u64 = rest.trim().parse().unwrap_or(0);
+                    info.push(("Ctx Sw".into(), format!("{}", val)));
+                    break;
+                }
             }
         }
     }
     info
+}
+
+// ── Season detection ──────────────────────────────────────────────────────
+
+/// Pure-arithmetic month from epoch using Howard Hinnant's civil_from_days.
+fn detect_season() -> Season {
+    let secs = SystemTime::now()
+        .duration_since(SystemTime::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs();
+    let days = (secs / 86400) as i64;
+    let z = days + 719468;
+    let era = (if z >= 0 { z } else { z - 146096 }) / 146097;
+    let doe = (z - era * 146097) as u32;
+    let yoe = (doe - doe / 1460 + doe / 36524 - doe / 146096) / 365;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let m = if mp < 10 { mp + 3 } else { mp - 9 };
+    match m {
+        3..=5 => Season::Spring,
+        6..=8 => Season::Summer,
+        9..=11 => Season::Autumn,
+        _ => Season::Winter,
+    }
+}
+
+// ── Local time ───────────────────────────────────────────────────────────
+
+/// Returns (hour, minute, second) in the system's local timezone.
+#[cfg(unix)]
+fn local_hm() -> (u8, u8, u8) {
+    // Safe FFI: localtime_r writes into our stack buffer and respects TZ.
+    extern "C" {
+        fn localtime_r(timep: *const i64, result: *mut i32) -> *mut i32;
+    }
+    let epoch = SystemTime::now()
+        .duration_since(SystemTime::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs() as i64;
+    let mut buf = [0i32; 16]; // oversized to cover any struct tm layout
+    unsafe {
+        localtime_r(&epoch, buf.as_mut_ptr());
+    }
+    (buf[2] as u8, buf[1] as u8, buf[0] as u8)
+}
+
+/// Fallback: UTC arithmetic (no timezone) for non-Unix platforms.
+#[cfg(not(unix))]
+fn local_hm() -> (u8, u8, u8) {
+    let secs = SystemTime::now()
+        .duration_since(SystemTime::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs();
+    let day_secs = (secs % 86400) as u32;
+    ((day_secs / 3600) as u8, ((day_secs % 3600) / 60) as u8, (day_secs % 60) as u8)
+}
+
+// ── Particle system impl ─────────────────────────────────────────────────
+
+impl ParticleSystem {
+    fn new() -> Self {
+        ParticleSystem {
+            particles: Vec::with_capacity(MAX_PARTICLES),
+            rng: fastrand::Rng::new(),
+            effect: WeatherEffect::Rain,
+            cycle_mode: CycleMode::Auto,
+            season_mode: SeasonMode::RealSeason,
+            intensity: 3,
+            speed: 2,
+            current_season: detect_season(),
+            season_timer: Instant::now(),
+            cycle_timer: Instant::now(),
+            lightning: LightningState {
+                active: false,
+                frames_remaining: 0,
+                bolt_segments: Vec::new(),
+                next_strike: Duration::from_secs(5),
+                timer: Instant::now(),
+            },
+            enabled: true,
+            frame_count: 0,
+            transition_cooldown: 0,
+        }
+    }
+
+    fn update(&mut self, width: u16, height: u16) {
+        if !self.enabled {
+            return;
+        }
+        self.frame_count = self.frame_count.wrapping_add(1);
+
+        // Auto-cycle effects
+        if self.cycle_mode == CycleMode::Auto && self.cycle_timer.elapsed() >= CYCLE_DURATION {
+            self.effect = match self.effect {
+                WeatherEffect::Rain => WeatherEffect::Snow,
+                WeatherEffect::Snow => WeatherEffect::Lightning,
+                WeatherEffect::Lightning => WeatherEffect::Seasons,
+                WeatherEffect::Seasons => WeatherEffect::Rain,
+            };
+            self.transition_cooldown = 5;
+            self.cycle_timer = Instant::now();
+        }
+
+        // Season auto-rotate (every 15s)
+        if self.effect == WeatherEffect::Seasons && self.season_mode == SeasonMode::AutoRotate {
+            if self.season_timer.elapsed() >= Duration::from_secs(15) {
+                self.current_season = match self.current_season {
+                    Season::Spring => Season::Summer,
+                    Season::Summer => Season::Autumn,
+                    Season::Autumn => Season::Winter,
+                    Season::Winter => Season::Spring,
+                };
+                self.season_timer = Instant::now();
+            }
+        }
+
+        // Speed multiplier
+        let speed_mult = match self.speed {
+            1 => 0.6_f32,
+            3 => 1.5,
+            _ => 1.0,
+        };
+
+        // Move existing particles
+        let w = width as f32;
+        let h = height as f32;
+        self.particles.retain_mut(|p| {
+            p.y += p.speed_y * speed_mult;
+            p.x += p.drift_x * speed_mult;
+            p.life = p.life.saturating_sub(1);
+            p.y < h + 1.0 && p.x >= -1.0 && p.x < w + 1.0 && p.life > 0
+        });
+
+        // Transition cooldown: drain old particles before spawning new effect
+        if self.transition_cooldown > 0 {
+            self.transition_cooldown -= 1;
+            return;
+        }
+
+        // Spawn new particles
+        let spawn_count = self.intensity as usize;
+        match self.effect {
+            WeatherEffect::Rain => self.spawn_rain(width, spawn_count),
+            WeatherEffect::Snow => self.spawn_snow(width, spawn_count),
+            WeatherEffect::Lightning => {
+                self.spawn_rain(width, spawn_count);
+                self.update_lightning(width, height);
+            }
+            WeatherEffect::Seasons => self.spawn_season(width, height, spawn_count),
+        }
+    }
+
+    fn spawn_rain(&mut self, width: u16, count: usize) {
+        for _ in 0..count {
+            if self.particles.len() >= MAX_PARTICLES {
+                break;
+            }
+            let heavy = self.rng.bool();
+            let (symbol, fg) = if heavy {
+                let syms: &[&str] = &["│", "|"];
+                (
+                    syms[self.rng.usize(..syms.len())],
+                    if self.rng.bool() {
+                        Color::Rgb(40, 60, 90) // dim blue
+                    } else {
+                        Color::Rgb(50, 80, 100) // dim cyan
+                    },
+                )
+            } else {
+                ("·", Color::Rgb(50, 50, 50)) // very dim mist
+            };
+            let has_wind = self.rng.u8(..) < 30;
+            self.particles.push(Particle {
+                x: self.rng.f32() * width as f32,
+                y: -(self.rng.f32() * 3.0),
+                symbol: if has_wind && heavy { "/" } else { symbol },
+                fg,
+                speed_y: if heavy {
+                    0.8 + self.rng.f32() * 0.6
+                } else {
+                    0.5 + self.rng.f32() * 0.3
+                },
+                drift_x: if has_wind {
+                    0.1 + self.rng.f32() * 0.1
+                } else {
+                    0.0
+                },
+                life: 200,
+            });
+        }
+    }
+
+    fn spawn_snow(&mut self, width: u16, count: usize) {
+        let fc = self.frame_count;
+        for _ in 0..count {
+            if self.particles.len() >= MAX_PARTICLES {
+                break;
+            }
+            let foreground = self.rng.bool();
+            let syms: &[&str] = &["*", "·", "•", "."];
+            let symbol = syms[self.rng.usize(..syms.len())];
+            let fg = if foreground {
+                Color::Rgb(120, 120, 130) // soft white
+            } else {
+                Color::Rgb(70, 70, 80) // dim gray
+            };
+            let seed = self.rng.f32() * 100.0;
+            self.particles.push(Particle {
+                x: self.rng.f32() * width as f32,
+                y: -(self.rng.f32() * 2.0),
+                symbol,
+                fg,
+                speed_y: if foreground {
+                    0.3 + self.rng.f32() * 0.2
+                } else {
+                    0.15 + self.rng.f32() * 0.15
+                },
+                drift_x: (seed + fc as f32 * 0.1).sin() * 0.3,
+                life: 300,
+            });
+        }
+    }
+
+    fn update_lightning(&mut self, width: u16, height: u16) {
+        if self.lightning.active {
+            self.lightning.frames_remaining = self.lightning.frames_remaining.saturating_sub(1);
+            if self.lightning.frames_remaining == 0 {
+                self.lightning.active = false;
+            }
+        } else if self.lightning.timer.elapsed() >= self.lightning.next_strike {
+            self.lightning.active = true;
+            self.lightning.frames_remaining = LIGHTNING_FLASH_FRAMES;
+            let bolt_x = self.rng.u16(2..width.saturating_sub(2).max(3));
+
+            self.lightning.bolt_segments.clear();
+            let mut x = bolt_x;
+            for y in 0..height {
+                self.lightning.bolt_segments.push((x, y));
+                match self.rng.u8(..3) {
+                    0 => x = x.saturating_sub(1),
+                    1 => x = (x + 1).min(width.saturating_sub(1)),
+                    _ => {}
+                }
+                // 30% chance of a branch segment
+                if self.rng.u8(..10) < 3 {
+                    let bx = if self.rng.bool() {
+                        x.saturating_sub(1)
+                    } else {
+                        (x + 1).min(width.saturating_sub(1))
+                    };
+                    self.lightning.bolt_segments.push((bx, y));
+                }
+            }
+
+            let range = LIGHTNING_MAX_INTERVAL_SECS - LIGHTNING_MIN_INTERVAL_SECS;
+            self.lightning.next_strike =
+                Duration::from_secs(LIGHTNING_MIN_INTERVAL_SECS + self.rng.u64(..=range));
+            self.lightning.timer = Instant::now();
+        }
+    }
+
+    fn spawn_season(&mut self, width: u16, height: u16, count: usize) {
+        let fc = self.frame_count;
+        for _ in 0..count {
+            if self.particles.len() >= MAX_PARTICLES {
+                break;
+            }
+            let season = match self.season_mode {
+                SeasonMode::RealSeason => detect_season(),
+                SeasonMode::AutoRotate => self.current_season,
+                SeasonMode::NatureBlend => match self.rng.u8(..4) {
+                    0 => Season::Spring,
+                    1 => Season::Summer,
+                    2 => Season::Autumn,
+                    _ => Season::Winter,
+                },
+            };
+            match season {
+                Season::Spring => {
+                    let syms: &[&str] = &["*", ".", "·", "'"];
+                    let colors: &[Color] = &[
+                        Color::Rgb(120, 60, 80),  // muted rose
+                        Color::Rgb(140, 80, 100), // soft magenta
+                        Color::Rgb(100, 70, 75),  // dusty pink
+                    ];
+                    let seed = self.rng.f32() * 10.0;
+                    self.particles.push(Particle {
+                        x: self.rng.f32() * width as f32,
+                        y: -(self.rng.f32() * 2.0),
+                        symbol: syms[self.rng.usize(..syms.len())],
+                        fg: colors[self.rng.usize(..colors.len())],
+                        speed_y: 0.15 + self.rng.f32() * 0.2,
+                        drift_x: (fc as f32 * 0.08 + seed).sin() * 0.25,
+                        life: 250,
+                    });
+                }
+                Season::Summer => {
+                    // Fireflies in the lower 40%, varied warm colors & brightness
+                    let syms: &[&str] = &[".", "·", "°", "*"];
+                    let colors: &[Color] = &[
+                        Color::Rgb(255, 200, 60),  // bright gold
+                        Color::Rgb(200, 160, 40),  // warm amber
+                        Color::Rgb(255, 180, 50),  // orange-gold
+                        Color::Rgb(140, 110, 30),  // dim ember
+                        Color::Rgb(180, 140, 35),  // muted amber
+                        Color::Rgb(100, 80, 20),   // faint glow
+                    ];
+                    let h = height as f32;
+                    self.particles.push(Particle {
+                        x: self.rng.f32() * width as f32,
+                        y: h * (0.6 + self.rng.f32() * 0.38),
+                        symbol: syms[self.rng.usize(..syms.len())],
+                        fg: colors[self.rng.usize(..colors.len())],
+                        speed_y: -0.05 + self.rng.f32() * 0.1,
+                        drift_x: (self.rng.f32() - 0.5) * 0.3,
+                        life: 20 + self.rng.u16(..35),
+                    });
+                }
+                Season::Autumn => {
+                    let syms: &[&str] = &["~", "}", "{", "\\", "/", "_"];
+                    let colors: &[Color] = &[
+                        Color::Rgb(130, 70, 0),  // dim orange
+                        Color::Rgb(110, 55, 15), // muted brown
+                        Color::Rgb(100, 40, 30), // dark rust
+                        Color::Rgb(120, 90, 20), // faded gold
+                    ];
+                    let seed = self.rng.f32() * 10.0;
+                    self.particles.push(Particle {
+                        x: self.rng.f32() * width as f32,
+                        y: -(self.rng.f32() * 2.0),
+                        symbol: syms[self.rng.usize(..syms.len())],
+                        fg: colors[self.rng.usize(..colors.len())],
+                        speed_y: 0.3 + self.rng.f32() * 0.5,
+                        drift_x: (fc as f32 * 0.12 + seed).sin() * 0.5,
+                        life: 200,
+                    });
+                }
+                Season::Winter => {
+                    let syms: &[&str] = &["*", ".", "·", "°", "+"];
+                    let foreground = self.rng.bool();
+                    let fg = if foreground {
+                        Color::Rgb(100, 100, 110) // soft white
+                    } else if self.rng.bool() {
+                        Color::Rgb(70, 85, 95) // dim ice-blue
+                    } else {
+                        Color::Rgb(55, 55, 60) // faint gray
+                    };
+                    let seed = self.rng.f32() * 100.0;
+                    let near_bottom = self.rng.f32();
+                    self.particles.push(Particle {
+                        x: self.rng.f32() * width as f32,
+                        y: -(self.rng.f32() * 2.0),
+                        symbol: syms[self.rng.usize(..syms.len())],
+                        fg,
+                        speed_y: if foreground {
+                            0.25 + self.rng.f32() * 0.2
+                        } else {
+                            0.1 + self.rng.f32() * 0.15
+                        } * if near_bottom > 0.8 { 0.5 } else { 1.0 },
+                        drift_x: (seed + fc as f32 * 0.05).sin() * 0.2,
+                        life: 300,
+                    });
+                }
+            }
+        }
+    }
 }
 
 fn format_bytes(bytes: f64) -> String {
@@ -403,13 +929,151 @@ fn sort_label(mode: SortMode) -> &'static str {
 // ── UI dispatch ────────────────────────────────────────────────────────────
 
 fn ui(frame: &mut Frame, app: &App) {
+    // Layer 1: widgets first (fill the screen)
     match app.active_tab {
         ActiveTab::Overview => ui_overview(frame, app),
         ActiveTab::Processes => ui_processes_tab(frame, app),
         ActiveTab::CpuDetail => ui_cpu_detail(frame, app),
     }
+    // Layer 0.5: clock digits — only into empty cells, behind particles
+    if !app.show_help && !app.show_settings {
+        render_clock(frame);
+    }
+    // Layer 0: particles — only into empty cells so data is never obscured
+    render_particles(frame, &app.particles);
+    // Layer 2: overlays
     if app.show_help {
         render_help_overlay(frame);
+    }
+    if app.show_settings {
+        render_settings_overlay(frame, app);
+    }
+}
+
+fn render_clock(frame: &mut Frame) {
+    let (h, m, s) = local_hm();
+    let colon_visible = s % 2 == 0;
+    let colon_idx: usize = if colon_visible { 10 } else { usize::MAX };
+
+    // Glyph sequence: H tens, H ones, colon, M tens, M ones
+    let digits: [usize; 5] = [
+        (h / 10) as usize,
+        (h % 10) as usize,
+        10, // colon slot
+        (m / 10) as usize,
+        (m % 10) as usize,
+    ];
+
+    // Each glyph: 6 chars wide (3 columns × 2 cells). Gaps: 2 chars between glyphs.
+    // Total: 5×6 + 4×2 = 38 columns, 5 rows tall.
+    let total_w: u16 = 38;
+    let total_h: u16 = 5;
+
+    let buf = frame.buffer_mut();
+    let area = *buf.area();
+    if area.width < total_w + 4 || area.height < total_h + 4 {
+        return; // terminal too small
+    }
+
+    let ox = (area.width - total_w) / 2;
+    let oy = (area.height - total_h) / 2;
+    let color = Color::Rgb(50, 50, 65);
+
+    for (gi, &idx) in digits.iter().enumerate() {
+        // Skip colon when it should be invisible (blink off)
+        if gi == 2 && idx != colon_idx {
+            continue;
+        }
+        if idx >= CLOCK_GLYPHS.len() {
+            continue;
+        }
+        let glyph = &CLOCK_GLYPHS[idx];
+        let gx = ox + (gi as u16) * 8; // 6 char glyph + 2 char gap
+
+        for (row, &bits) in glyph.iter().enumerate() {
+            for col in 0..3u16 {
+                if bits & (1 << (2 - col)) != 0 {
+                    let cx = gx + col * 2;
+                    let cy = oy + row as u16;
+                    // Write two cells ("██") for each set pixel
+                    for dx in 0..2u16 {
+                        let x = cx + dx;
+                        let y = cy;
+                        if x < area.width && y < area.height {
+                            if let Some(cell) = buf.cell_mut((x, y)) {
+                                if cell.symbol() == " " {
+                                    cell.set_symbol("█");
+                                    cell.set_fg(color);
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
+fn render_particles(frame: &mut Frame, ps: &ParticleSystem) {
+    if !ps.enabled {
+        return;
+    }
+    let buf = frame.buffer_mut();
+    let area = *buf.area();
+
+    // Lightning flash: subtle tint only on empty cells
+    if ps.lightning.active && ps.effect == WeatherEffect::Lightning {
+        let tint = match ps.lightning.frames_remaining {
+            3 => Some(Color::Rgb(15, 15, 30)),
+            2 => Some(Color::Rgb(30, 30, 55)),
+            1 => Some(Color::Rgb(18, 18, 35)),
+            _ => None,
+        };
+        if let Some(bg) = tint {
+            for y in area.y..area.y + area.height {
+                for x in area.x..area.x + area.width {
+                    if let Some(cell) = buf.cell_mut((x, y)) {
+                        if cell.symbol() == " " {
+                            cell.set_bg(bg);
+                        }
+                    }
+                }
+            }
+        }
+        // Draw bolt segments only into empty cells
+        if ps.lightning.frames_remaining >= 2 {
+            for &(bx, by) in &ps.lightning.bolt_segments {
+                if bx < area.width && by < area.height {
+                    if let Some(cell) = buf.cell_mut((bx, by)) {
+                        if cell.symbol() == " " {
+                            let sym = if by % 3 == 0 {
+                                "╲"
+                            } else if by % 3 == 1 {
+                                "│"
+                            } else {
+                                "╱"
+                            };
+                            cell.set_symbol(sym);
+                            cell.set_fg(Color::Rgb(180, 180, 100));
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    // Draw particles only into empty cells — garnish, never obscure data
+    for p in &ps.particles {
+        let px = p.x as u16;
+        let py = p.y as u16;
+        if px < area.width && py < area.height {
+            if let Some(cell) = buf.cell_mut((px, py)) {
+                if cell.symbol() == " " {
+                    cell.set_symbol(p.symbol);
+                    cell.set_fg(p.fg);
+                }
+            }
+        }
     }
 }
 
@@ -993,7 +1657,7 @@ fn render_cpu_sparklines(frame: &mut Frame, app: &App, area: Rect) {
 fn render_help_overlay(frame: &mut Frame) {
     let area = frame.area();
     let popup_w = 50u16.min(area.width.saturating_sub(4));
-    let popup_h = 18u16.min(area.height.saturating_sub(4));
+    let popup_h = 22u16.min(area.height.saturating_sub(4));
     let x = (area.width.saturating_sub(popup_w)) / 2;
     let y = (area.height.saturating_sub(popup_h)) / 2;
     let popup = Rect::new(x, y, popup_w, popup_h);
@@ -1058,6 +1722,17 @@ fn render_help_overlay(frame: &mut Frame) {
             Span::styled("  Up/Down  ", Style::default().fg(Color::Yellow)),
             Span::raw("Scroll process list"),
         ]),
+        Line::from(""),
+        Line::from(Span::styled(
+            " Background",
+            Style::default()
+                .fg(Color::Cyan)
+                .add_modifier(Modifier::BOLD),
+        )),
+        Line::from(vec![
+            Span::styled("  b        ", Style::default().fg(Color::Yellow)),
+            Span::raw("Background effects settings"),
+        ]),
     ];
 
     let help = Paragraph::new(text).block(
@@ -1067,6 +1742,167 @@ fn render_help_overlay(frame: &mut Frame) {
             .border_style(Style::default().fg(Color::Cyan)),
     );
     frame.render_widget(help, popup);
+}
+
+/// Settings overlay: centered popup for background effect controls
+fn render_settings_overlay(frame: &mut Frame, app: &App) {
+    let area = frame.area();
+    let popup_w = 46u16.min(area.width.saturating_sub(4));
+    let popup_h = 12u16.min(area.height.saturating_sub(4));
+    let x = (area.width.saturating_sub(popup_w)) / 2;
+    let y = (area.height.saturating_sub(popup_h)) / 2;
+    let popup = Rect::new(x, y, popup_w, popup_h);
+
+    frame.render_widget(Clear, popup);
+
+    let effect_name = match app.particles.effect {
+        WeatherEffect::Rain => "Rain",
+        WeatherEffect::Snow => "Snow",
+        WeatherEffect::Lightning => "Lightning",
+        WeatherEffect::Seasons => "Seasons",
+    };
+    let cycle_name = match app.particles.cycle_mode {
+        CycleMode::Auto => "Auto-cycle",
+        CycleMode::Pinned => "Pinned",
+    };
+    let season_name = match app.particles.season_mode {
+        SeasonMode::AutoRotate => "Auto-rotate",
+        SeasonMode::RealSeason => "Real season",
+        SeasonMode::NatureBlend => "Nature blend",
+    };
+    let int = app.particles.intensity as usize;
+    let spd = app.particles.speed as usize;
+    let intensity_bar = format!(
+        "{}{} ({}/5)",
+        "\u{2588}".repeat(int),
+        "\u{2591}".repeat(5 - int),
+        int
+    );
+    let speed_bar = format!(
+        "{}{} ({}/3)",
+        "\u{2588}".repeat(spd),
+        "\u{2591}".repeat(3 - spd),
+        spd
+    );
+
+    let labels = ["Effect", "Cycle Mode", "Season Mode", "Intensity", "Speed"];
+    let values = [
+        format!("\u{25c2} {} \u{25b8}", effect_name),
+        format!("\u{25c2} {} \u{25b8}", cycle_name),
+        format!("\u{25c2} {} \u{25b8}", season_name),
+        format!("\u{25c2} {} \u{25b8}", intensity_bar),
+        format!("\u{25c2} {} \u{25b8}", speed_bar),
+    ];
+    let all_rows = [
+        SettingsRow::Effect,
+        SettingsRow::CycleMode,
+        SettingsRow::SeasonMode,
+        SettingsRow::Intensity,
+        SettingsRow::Speed,
+    ];
+
+    let mut lines = vec![
+        Line::from(Span::styled(
+            " Background Effects",
+            Style::default()
+                .fg(Color::Cyan)
+                .add_modifier(Modifier::BOLD),
+        )),
+        Line::from(""),
+    ];
+
+    for (i, (label, value)) in labels.iter().zip(values.iter()).enumerate() {
+        let selected = all_rows[i] == app.settings_row;
+        let (indicator, style) = if selected {
+            (
+                "\u{25b6} ",
+                Style::default().fg(Color::Yellow),
+            )
+        } else {
+            ("  ", Style::default().fg(Color::White))
+        };
+        lines.push(Line::from(vec![
+            Span::styled(indicator, style),
+            Span::styled(format!("{:<14}", label), style),
+            Span::styled(value.as_str(), style),
+        ]));
+    }
+
+    lines.push(Line::from(""));
+    lines.push(Line::from(Span::styled(
+        "  \u{2190}/\u{2192} change  \u{2191}/\u{2193} navigate  Esc close",
+        Style::default().fg(Color::DarkGray),
+    )));
+
+    let settings = Paragraph::new(lines).block(
+        Block::default()
+            .title(" Settings ")
+            .borders(Borders::ALL)
+            .border_style(Style::default().fg(Color::Yellow)),
+    );
+    frame.render_widget(settings, popup);
+}
+
+fn settings_change(ps: &mut ParticleSystem, row: SettingsRow, right: bool) {
+    match row {
+        SettingsRow::Effect => {
+            ps.effect = if right {
+                match ps.effect {
+                    WeatherEffect::Rain => WeatherEffect::Snow,
+                    WeatherEffect::Snow => WeatherEffect::Lightning,
+                    WeatherEffect::Lightning => WeatherEffect::Seasons,
+                    WeatherEffect::Seasons => WeatherEffect::Rain,
+                }
+            } else {
+                match ps.effect {
+                    WeatherEffect::Rain => WeatherEffect::Seasons,
+                    WeatherEffect::Snow => WeatherEffect::Rain,
+                    WeatherEffect::Lightning => WeatherEffect::Snow,
+                    WeatherEffect::Seasons => WeatherEffect::Lightning,
+                }
+            };
+            ps.particles.clear();
+            ps.transition_cooldown = 5;
+            ps.cycle_timer = Instant::now();
+        }
+        SettingsRow::CycleMode => {
+            ps.cycle_mode = match ps.cycle_mode {
+                CycleMode::Auto => CycleMode::Pinned,
+                CycleMode::Pinned => CycleMode::Auto,
+            };
+            ps.cycle_timer = Instant::now();
+        }
+        SettingsRow::SeasonMode => {
+            ps.season_mode = if right {
+                match ps.season_mode {
+                    SeasonMode::AutoRotate => SeasonMode::RealSeason,
+                    SeasonMode::RealSeason => SeasonMode::NatureBlend,
+                    SeasonMode::NatureBlend => SeasonMode::AutoRotate,
+                }
+            } else {
+                match ps.season_mode {
+                    SeasonMode::AutoRotate => SeasonMode::NatureBlend,
+                    SeasonMode::RealSeason => SeasonMode::AutoRotate,
+                    SeasonMode::NatureBlend => SeasonMode::RealSeason,
+                }
+            };
+            ps.season_timer = Instant::now();
+        }
+        SettingsRow::Intensity => {
+            if right {
+                ps.intensity = (ps.intensity + 1).min(5);
+            } else {
+                ps.intensity = ps.intensity.saturating_sub(1).max(1);
+            }
+        }
+        SettingsRow::Speed => {
+            if right {
+                ps.speed = (ps.speed + 1).min(3);
+            } else {
+                ps.speed = ps.speed.saturating_sub(1).max(1);
+            }
+        }
+    }
 }
 
 /// Status bar: tab name, sort mode, help hint (or filter input)
@@ -1106,7 +1942,23 @@ fn render_status_bar(frame: &mut Frame, app: &App, area: Rect) {
                 format!(" {} cpus ", app.sys.cpus().len()),
                 Style::default().fg(Color::DarkGray),
             ),
-            Span::styled("  ?: help ", Style::default().fg(Color::DarkGray)),
+            Span::raw("  "),
+            Span::styled(
+                format!(
+                    " {} ",
+                    match app.particles.effect {
+                        WeatherEffect::Rain => "Rain",
+                        WeatherEffect::Snow => "Snow",
+                        WeatherEffect::Lightning => "Lightning",
+                        WeatherEffect::Seasons => "Seasons",
+                    }
+                ),
+                Style::default().fg(Color::Black).bg(Color::Blue),
+            ),
+            Span::styled(
+                "  ?: help  b: effects ",
+                Style::default().fg(Color::DarkGray),
+            ),
         ]));
         frame.render_widget(status, area);
     }
@@ -1127,11 +1979,16 @@ fn main() -> io::Result<()> {
     app.tick();
 
     let mut last_tick = Instant::now();
+    let mut last_anim = Instant::now();
 
     loop {
         terminal.draw(|f| ui(f, &app))?;
 
-        let timeout = TICK_RATE.saturating_sub(last_tick.elapsed());
+        // Dual-tick: wake for whichever fires next
+        let until_data = TICK_RATE.saturating_sub(last_tick.elapsed());
+        let until_anim = ANIM_TICK.saturating_sub(last_anim.elapsed());
+        let timeout = until_data.min(until_anim);
+
         if event::poll(timeout)? {
             if let Event::Key(key) = event::read()? {
                 if key.kind == KeyEventKind::Press {
@@ -1152,6 +2009,19 @@ fn main() -> io::Result<()> {
                             KeyCode::Char(c) => {
                                 app.filter_text.push(c);
                                 app.process_scroll = 0;
+                            }
+                            _ => {}
+                        }
+                    } else if app.show_settings {
+                        match key.code {
+                            KeyCode::Esc | KeyCode::Char('b') => app.show_settings = false,
+                            KeyCode::Up => app.settings_row = app.settings_row.prev(),
+                            KeyCode::Down => app.settings_row = app.settings_row.next(),
+                            KeyCode::Left => {
+                                settings_change(&mut app.particles, app.settings_row, false)
+                            }
+                            KeyCode::Right => {
+                                settings_change(&mut app.particles, app.settings_row, true)
                             }
                             _ => {}
                         }
@@ -1177,6 +2047,7 @@ fn main() -> io::Result<()> {
                                 app.filter_text.clear();
                             }
                             KeyCode::Char('?') => app.show_help = !app.show_help,
+                            KeyCode::Char('b') => app.show_settings = !app.show_settings,
                             KeyCode::Up => {
                                 app.process_scroll = app.process_scroll.saturating_sub(1);
                             }
@@ -1190,6 +2061,14 @@ fn main() -> io::Result<()> {
             }
         }
 
+        // Animation tick (10 FPS)
+        if last_anim.elapsed() >= ANIM_TICK {
+            let size = terminal.size()?;
+            app.particles.update(size.width, size.height);
+            last_anim = Instant::now();
+        }
+
+        // Data tick (1 Hz)
         if last_tick.elapsed() >= TICK_RATE {
             app.tick();
             last_tick = Instant::now();

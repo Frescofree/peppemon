@@ -14,6 +14,7 @@ readme = "README.md"
 ratatui = "0.29"
 crossterm = "0.28"
 sysinfo = "0.33"
+fastrand = "2"
 
 [profile.release]
 opt-level = 3
