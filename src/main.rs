@@ -23,7 +23,7 @@ use sysinfo::{CpuRefreshKind, MemoryRefreshKind, ProcessRefreshKind, RefreshKind
 
 const HISTORY_LEN: usize = 60;
 const TICK_RATE: Duration = Duration::from_millis(1000);
-const ANIM_TICK: Duration = Duration::from_millis(16);
+const ANIM_TICK: Duration = Duration::from_millis(50);
 const MAX_PARTICLES: usize = 100;
 const CYCLE_DURATION: Duration = Duration::from_secs(45);
 const LIGHTNING_FLASH_FRAMES: u8 = 18;
@@ -203,6 +203,8 @@ struct App {
     show_settings: bool,
     settings_row: SettingsRow,
     particles: ParticleSystem,
+    // Cached data (refreshed on data tick, not every frame)
+    cached_sysinfo: Vec<(String, String)>,
 }
 
 impl App {
@@ -211,7 +213,7 @@ impl App {
             RefreshKind::nothing()
                 .with_cpu(CpuRefreshKind::everything())
                 .with_memory(MemoryRefreshKind::everything())
-                .with_processes(ProcessRefreshKind::everything()),
+                .with_processes(ProcessRefreshKind::nothing().with_cpu().with_memory()),
         );
         let cpu_count = sys.cpus().len().max(1);
         let cpu_history = (0..cpu_count)
@@ -260,6 +262,7 @@ impl App {
             show_settings: false,
             settings_row: SettingsRow::Effect,
             particles: ParticleSystem::new(),
+            cached_sysinfo: read_system_info(),
         }
     }
 
@@ -299,6 +302,9 @@ impl App {
         // CPU sensors
         self.cpu_temp = read_cpu_temp();
         self.cpu_freq_avg = read_cpu_freq();
+
+        // Cached system info (uptime, load, etc.)
+        self.cached_sysinfo = read_system_info();
     }
 
     fn update_net(&mut self) {
@@ -706,13 +712,13 @@ impl ParticleSystem {
                 (
                     syms[self.rng.usize(..syms.len())],
                     if self.rng.bool() {
-                        Color::Rgb(40, 60, 90) // dim blue
+                        Color::Rgb(30, 45, 70) // dim blue
                     } else {
-                        Color::Rgb(50, 80, 100) // dim cyan
+                        Color::Rgb(35, 55, 75) // dim cyan
                     },
                 )
             } else {
-                ("·", Color::Rgb(50, 50, 50)) // very dim mist
+                ("·", Color::Rgb(35, 35, 40)) // very dim mist
             };
             let has_wind = self.rng.u8(..) < 30;
             self.particles.push(Particle {
@@ -940,10 +946,6 @@ fn ui(frame: &mut Frame, app: &App) {
         ActiveTab::Processes => ui_processes_tab(frame, app),
         ActiveTab::CpuDetail => ui_cpu_detail(frame, app),
     }
-    // Layer 0.5: clock digits — only into empty cells, behind particles
-    if !app.show_help && !app.show_settings {
-        render_clock(frame);
-    }
     // Layer 0: particles — only into empty cells so data is never obscured
     render_particles(frame, &app.particles);
     // Layer 2: overlays
@@ -955,38 +957,43 @@ fn ui(frame: &mut Frame, app: &App) {
     }
 }
 
-fn render_clock(frame: &mut Frame) {
+fn render_clock(frame: &mut Frame, area: Rect) {
     let (h, m, s) = local_hm();
     let colon_visible = s % 2 == 0;
     let colon_idx: usize = if colon_visible { 10 } else { usize::MAX };
 
-    // Glyph sequence: H tens, H ones, colon, M tens, M ones
     let digits: [usize; 5] = [
         (h / 10) as usize,
         (h % 10) as usize,
-        10, // colon slot
+        10,
         (m / 10) as usize,
         (m % 10) as usize,
     ];
 
-    // Each glyph: 6 chars wide (3 columns × 2 cells). Gaps: 2 chars between glyphs.
-    // Total: 5×6 + 4×2 = 38 columns, 5 rows tall.
-    let total_w: u16 = 38;
-    let total_h: u16 = 5;
+    // Draw the bordered box — same rounded style + palette as other panels
+    let clock_block = Block::default()
+        .title(Line::from(" clock ").right_aligned())
+        .borders(Borders::ALL)
+        .border_type(BorderType::Rounded)
+        .border_style(Style::default().fg(Color::Rgb(100, 120, 220)))
+        .style(Style::default().bg(Color::Rgb(10, 10, 18)));
+    frame.render_widget(clock_block, area);
 
-    let buf = frame.buffer_mut();
-    let area = *buf.area();
-    if area.width < total_w + 4 || area.height < total_h + 4 {
-        return; // terminal too small
+    // Inner area (inside border)
+    let inner = Rect::new(area.x + 1, area.y + 1, area.width.saturating_sub(2), area.height.saturating_sub(2));
+    if inner.width < 38 || inner.height < 5 {
+        return; // too small for pixel digits
     }
 
-    let ox = (area.width - total_w) / 2;
-    let oy = 1;
-    let fg_color = Color::Rgb(70, 80, 130);
-    let bg_color = Color::Rgb(22, 24, 40);
+    // Center the 38-wide × 5-tall glyph block inside the inner area
+    let ox = inner.x + (inner.width.saturating_sub(38)) / 2;
+    let oy = inner.y + (inner.height.saturating_sub(5)) / 2;
+    let fg_color = Color::Rgb(100, 120, 200);
+    let bg_color = Color::Rgb(10, 10, 18);
 
+    let buf = frame.buffer_mut();
+    let buf_area = *buf.area();
     for (gi, &idx) in digits.iter().enumerate() {
-        // Skip colon when it should be invisible (blink off)
         if gi == 2 && idx != colon_idx {
             continue;
         }
@@ -994,26 +1001,20 @@ fn render_clock(frame: &mut Frame) {
             continue;
         }
         let glyph = &CLOCK_GLYPHS[idx];
-        let gx = ox + (gi as u16) * 8; // 6 char glyph + 2 char gap
+        let gx = ox + (gi as u16) * 8;
 
         for (row, &bits) in glyph.iter().enumerate() {
             for col in 0..3u16 {
                 if bits & (1 << (2 - col)) != 0 {
                     let cx = gx + col * 2;
                     let cy = oy + row as u16;
-                    // Write two cells ("██") for each set pixel
                     for dx in 0..2u16 {
-                        let x = cx + dx;
-                        let y = cy;
-                        if x < area.width && y < area.height {
-                            if let Some(cell) = buf.cell_mut((x, y)) {
-                                if cell.symbol() == " " {
-                                    cell.set_symbol("█");
-                                    cell.set_fg(fg_color);
-                                } else {
-                                    // Glow behind existing widget text
-                                    cell.set_bg(bg_color);
-                                }
+                        let px = cx + dx;
+                        if px < buf_area.width && cy < buf_area.height {
+                            if let Some(cell) = buf.cell_mut((px, cy)) {
+                                cell.set_symbol("█");
+                                cell.set_fg(fg_color);
+                                cell.set_bg(bg_color);
                             }
                         }
                     }
@@ -1105,8 +1106,15 @@ fn ui_overview(frame: &mut Frame, app: &App) {
         .constraints([Constraint::Percentage(65), Constraint::Percentage(35)])
         .split(main_chunks[0]);
 
+    // Split the right column: System Info on top, Clock at bottom
+    let right_chunks = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([Constraint::Min(4), Constraint::Length(7)])
+        .split(top_chunks[1]);
+
     render_cpu(frame, app, top_chunks[0]);
-    render_sysinfo(frame, top_chunks[1]);
+    render_sysinfo(frame, app, right_chunks[0]);
+    render_clock(frame, right_chunks[1]);
 
     let mid_chunks = Layout::default()
         .direction(Direction::Horizontal)
@@ -1219,8 +1227,8 @@ fn render_cpu(frame: &mut Frame, app: &App, area: Rect) {
     frame.render_widget(chart, area);
 }
 
-fn render_sysinfo(frame: &mut Frame, area: Rect) {
-    let info = read_system_info();
+fn render_sysinfo(frame: &mut Frame, app: &App, area: Rect) {
+    let info = &app.cached_sysinfo;
     let rows: Vec<Row> = info
         .iter()
         .map(|(k, v)| {
@@ -1294,7 +1302,7 @@ fn render_memory(frame: &mut Frame, app: &App, area: Rect) {
                 } else {
                     Color::Rgb(140, 160, 255)
                 })
-                .bg(Color::Rgb(30, 30, 50)),
+                .bg(Color::Rgb(16, 16, 28)),
         )
         .ratio(mem_pct.min(1.0))
         .label(format!("{:.0}%", mem_pct * 100.0));
@@ -1316,7 +1324,7 @@ fn render_memory(frame: &mut Frame, app: &App, area: Rect) {
                 } else {
                     Color::Rgb(180, 100, 255)
                 })
-                .bg(Color::Rgb(30, 30, 50)),
+                .bg(Color::Rgb(16, 16, 28)),
         )
         .ratio(swap_pct.min(1.0))
         .label(format!("{:.0}%", swap_pct * 100.0));
@@ -1469,7 +1477,7 @@ fn render_processes(frame: &mut Frame, app: &App, area: Rect) {
                 Span::raw(format!("{:.1} MB", *mem as f64 / 1_048_576.0)),
             ]);
             if i % 2 == 1 {
-                row.style(Style::default().bg(Color::Rgb(22, 24, 40)))
+                row.style(Style::default().bg(Color::Rgb(12, 13, 24)))
             } else {
                 row
             }
@@ -1581,7 +1589,7 @@ fn render_processes_full(frame: &mut Frame, app: &App, area: Rect) {
                 Span::raw(format!("{:.1} MB", *mem as f64 / 1_048_576.0)),
             ]);
             if i % 2 == 1 {
-                row.style(Style::default().bg(Color::Rgb(22, 24, 40)))
+                row.style(Style::default().bg(Color::Rgb(12, 13, 24)))
             } else {
                 row
             }
@@ -2082,9 +2090,13 @@ fn main() -> io::Result<()> {
 
     let mut last_tick = Instant::now();
     let mut last_anim = Instant::now();
+    let mut needs_redraw = true;
 
     loop {
-        terminal.draw(|f| ui(f, &app))?;
+        if needs_redraw {
+            terminal.draw(|f| ui(f, &app))?;
+            needs_redraw = false;
+        }
 
         // Dual-tick: wake for whichever fires next
         let until_data = TICK_RATE.saturating_sub(last_tick.elapsed());
@@ -2094,6 +2106,7 @@ fn main() -> io::Result<()> {
         if event::poll(timeout)? {
             if let Event::Key(key) = event::read()? {
                 if key.kind == KeyEventKind::Press {
+                    needs_redraw = true;
                     if app.filter_mode {
                         match key.code {
                             KeyCode::Esc => {
@@ -2128,7 +2141,6 @@ fn main() -> io::Result<()> {
                             _ => {}
                         }
                     } else if app.show_help {
-                        // Any key dismisses help
                         app.show_help = false;
                     } else {
                         match key.code {
@@ -2163,18 +2175,20 @@ fn main() -> io::Result<()> {
             }
         }
 
-        // Animation tick (30 FPS)
+        // Animation tick (20 FPS)
         if last_anim.elapsed() >= ANIM_TICK {
             let dt = last_anim.elapsed().as_secs_f32().min(0.15);
             let size = terminal.size()?;
             app.particles.update(size.width, size.height, dt);
             last_anim = Instant::now();
+            needs_redraw = true;
         }
 
         // Data tick (1 Hz)
         if last_tick.elapsed() >= TICK_RATE {
             app.tick();
             last_tick = Instant::now();
+            needs_redraw = true;
         }
 
         if app.should_quit {
