@@ -8,7 +8,8 @@ use ratatui::{
     style::{Color, Modifier, Style},
     text::{Line, Span},
     widgets::{
-        Bar, BarChart, BarGroup, Block, Borders, Clear, Gauge, Paragraph, Row, Sparkline, Table,
+        Bar, BarChart, BarGroup, Block, BorderType, Borders, Clear, Gauge, Paragraph, Row,
+        Sparkline, Table,
     },
     Frame,
 };
@@ -22,10 +23,10 @@ use sysinfo::{CpuRefreshKind, MemoryRefreshKind, ProcessRefreshKind, RefreshKind
 
 const HISTORY_LEN: usize = 60;
 const TICK_RATE: Duration = Duration::from_millis(1000);
-const ANIM_TICK: Duration = Duration::from_millis(100);
+const ANIM_TICK: Duration = Duration::from_millis(16);
 const MAX_PARTICLES: usize = 100;
 const CYCLE_DURATION: Duration = Duration::from_secs(45);
-const LIGHTNING_FLASH_FRAMES: u8 = 3;
+const LIGHTNING_FLASH_FRAMES: u8 = 18;
 const LIGHTNING_MIN_INTERVAL_SECS: u64 = 3;
 const LIGHTNING_MAX_INTERVAL_SECS: u64 = 8;
 
@@ -606,7 +607,7 @@ impl ParticleSystem {
             cycle_mode: CycleMode::Auto,
             season_mode: SeasonMode::RealSeason,
             intensity: 3,
-            speed: 2,
+            speed: 5,
             current_season: detect_season(),
             season_timer: Instant::now(),
             cycle_timer: Instant::now(),
@@ -623,7 +624,7 @@ impl ParticleSystem {
         }
     }
 
-    fn update(&mut self, width: u16, height: u16) {
+    fn update(&mut self, width: u16, height: u16, dt: f32) {
         if !self.enabled {
             return;
         }
@@ -637,7 +638,7 @@ impl ParticleSystem {
                 WeatherEffect::Lightning => WeatherEffect::Seasons,
                 WeatherEffect::Seasons => WeatherEffect::Rain,
             };
-            self.transition_cooldown = 5;
+            self.transition_cooldown = 30;
             self.cycle_timer = Instant::now();
         }
 
@@ -654,19 +655,18 @@ impl ParticleSystem {
             }
         }
 
-        // Speed multiplier
-        let speed_mult = match self.speed {
-            1 => 0.6_f32,
-            3 => 1.5,
-            _ => 1.0,
-        };
+        // Speed multiplier: linear ramp from 0.2 (speed=1) to 3.0 (speed=10)
+        let speed_mult = 0.2 + (self.speed as f32 - 1.0) * (2.8 / 9.0);
+
+        // Delta-time factor: normalized so 1.0 = old 100ms rate
+        let dt_factor = dt * 10.0;
 
         // Move existing particles
         let w = width as f32;
         let h = height as f32;
         self.particles.retain_mut(|p| {
-            p.y += p.speed_y * speed_mult;
-            p.x += p.drift_x * speed_mult;
+            p.y += p.speed_y * speed_mult * dt_factor;
+            p.x += p.drift_x * speed_mult * dt_factor;
             p.life = p.life.saturating_sub(1);
             p.y < h + 1.0 && p.x >= -1.0 && p.x < w + 1.0 && p.life > 0
         });
@@ -674,6 +674,11 @@ impl ParticleSystem {
         // Transition cooldown: drain old particles before spawning new effect
         if self.transition_cooldown > 0 {
             self.transition_cooldown -= 1;
+            return;
+        }
+
+        // Spawn throttle: only spawn every 6th frame to keep same density at 6x frame rate
+        if self.frame_count % 6 != 0 {
             return;
         }
 
@@ -725,7 +730,7 @@ impl ParticleSystem {
                 } else {
                     0.0
                 },
-                life: 200,
+                life: 1200,
             });
         }
     }
@@ -756,7 +761,7 @@ impl ParticleSystem {
                     0.15 + self.rng.f32() * 0.15
                 },
                 drift_x: (seed + fc as f32 * 0.1).sin() * 0.3,
-                life: 300,
+                life: 1800,
             });
         }
     }
@@ -831,7 +836,7 @@ impl ParticleSystem {
                         fg: colors[self.rng.usize(..colors.len())],
                         speed_y: 0.15 + self.rng.f32() * 0.2,
                         drift_x: (fc as f32 * 0.08 + seed).sin() * 0.25,
-                        life: 250,
+                        life: 1500,
                     });
                 }
                 Season::Summer => {
@@ -853,7 +858,7 @@ impl ParticleSystem {
                         fg: colors[self.rng.usize(..colors.len())],
                         speed_y: -0.05 + self.rng.f32() * 0.1,
                         drift_x: (self.rng.f32() - 0.5) * 0.3,
-                        life: 20 + self.rng.u16(..35),
+                        life: 120 + self.rng.u16(..210),
                     });
                 }
                 Season::Autumn => {
@@ -872,7 +877,7 @@ impl ParticleSystem {
                         fg: colors[self.rng.usize(..colors.len())],
                         speed_y: 0.3 + self.rng.f32() * 0.5,
                         drift_x: (fc as f32 * 0.12 + seed).sin() * 0.5,
-                        life: 200,
+                        life: 1200,
                     });
                 }
                 Season::Winter => {
@@ -898,7 +903,7 @@ impl ParticleSystem {
                             0.1 + self.rng.f32() * 0.15
                         } * if near_bottom > 0.8 { 0.5 } else { 1.0 },
                         drift_x: (seed + fc as f32 * 0.05).sin() * 0.2,
-                        life: 300,
+                        life: 1800,
                     });
                 }
             }
@@ -977,8 +982,8 @@ fn render_clock(frame: &mut Frame) {
 
     let ox = (area.width - total_w) / 2;
     let oy = (area.height - total_h) / 2;
-    let fg_color = Color::Rgb(90, 90, 115);
-    let bg_color = Color::Rgb(30, 30, 45);
+    let fg_color = Color::Rgb(70, 80, 130);
+    let bg_color = Color::Rgb(22, 24, 40);
 
     for (gi, &idx) in digits.iter().enumerate() {
         // Skip colon when it should be invisible (blink off)
@@ -1028,9 +1033,9 @@ fn render_particles(frame: &mut Frame, ps: &ParticleSystem) {
     // Lightning flash: subtle tint only on empty cells
     if ps.lightning.active && ps.effect == WeatherEffect::Lightning {
         let tint = match ps.lightning.frames_remaining {
-            3 => Some(Color::Rgb(15, 15, 30)),
-            2 => Some(Color::Rgb(30, 30, 55)),
-            1 => Some(Color::Rgb(18, 18, 35)),
+            13..=18 => Some(Color::Rgb(15, 15, 30)),
+            7..=12 => Some(Color::Rgb(30, 30, 55)),
+            1..=6 => Some(Color::Rgb(18, 18, 35)),
             _ => None,
         };
         if let Some(bg) = tint {
@@ -1045,7 +1050,7 @@ fn render_particles(frame: &mut Frame, ps: &ParticleSystem) {
             }
         }
         // Draw bolt segments only into empty cells
-        if ps.lightning.frames_remaining >= 2 {
+        if ps.lightning.frames_remaining >= 12 {
             for &(bx, by) in &ps.lightning.bolt_segments {
                 if bx < area.width && by < area.height {
                     if let Some(cell) = buf.cell_mut((bx, by)) {
@@ -1088,9 +1093,9 @@ fn ui_overview(frame: &mut Frame, app: &App) {
     let main_chunks = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
-            Constraint::Length(12),
-            Constraint::Length(10),
-            Constraint::Min(8),
+            Constraint::Fill(3),
+            Constraint::Fill(2),
+            Constraint::Fill(5),
             Constraint::Length(1),
         ])
         .split(size);
@@ -1148,6 +1153,20 @@ fn ui_cpu_detail(frame: &mut Frame, app: &App) {
 
 // ── Render functions ───────────────────────────────────────────────────────
 
+fn cpu_gradient(usage: u64) -> Color {
+    if usage > 95 {
+        Color::Rgb(255, 60, 60)
+    } else if usage > 80 {
+        Color::Rgb(255, 140, 50)
+    } else if usage > 60 {
+        Color::Rgb(255, 220, 50)
+    } else if usage > 30 {
+        Color::Rgb(80, 200, 120)
+    } else {
+        Color::Rgb(60, 160, 200)
+    }
+}
+
 fn render_cpu(frame: &mut Frame, app: &App, area: Rect) {
     let cpu_count = app.sys.cpus().len();
     let bars: Vec<Bar> = app
@@ -1157,13 +1176,7 @@ fn render_cpu(frame: &mut Frame, app: &App, area: Rect) {
         .enumerate()
         .map(|(i, cpu)| {
             let usage = cpu.cpu_usage() as u64;
-            let color = if usage > 90 {
-                Color::Red
-            } else if usage > 60 {
-                Color::Yellow
-            } else {
-                Color::Green
-            };
+            let color = cpu_gradient(usage);
             Bar::default()
                 .value(usage)
                 .label(Line::from(format!("C{}", i)))
@@ -1182,15 +1195,24 @@ fn render_cpu(frame: &mut Frame, app: &App, area: Rect) {
         (None, None) => format!(" CPU Usage (avg: {:.0}%) ", avg),
     };
 
+    let inner_w = area.width.saturating_sub(2);
+    let bar_w = if cpu_count > 0 {
+        ((inner_w + 1) / cpu_count as u16).saturating_sub(1).max(3)
+    } else {
+        5
+    };
+
     let chart = BarChart::default()
         .block(
             Block::default()
                 .title(title)
+                .title_bottom(Line::from(format!(" {} cores ", cpu_count)).right_aligned())
                 .borders(Borders::ALL)
-                .border_style(Style::default().fg(Color::Cyan)),
+                .border_type(BorderType::Rounded)
+                .border_style(Style::default().fg(Color::Rgb(100, 120, 220))),
         )
         .data(BarGroup::default().bars(&bars))
-        .bar_width(5)
+        .bar_width(bar_w)
         .bar_gap(1)
         .max(100);
 
@@ -1203,7 +1225,7 @@ fn render_sysinfo(frame: &mut Frame, area: Rect) {
         .iter()
         .map(|(k, v)| {
             Row::new(vec![
-                Span::styled(k.as_str(), Style::default().fg(Color::Cyan)),
+                Span::styled(k.as_str(), Style::default().fg(Color::Rgb(180, 100, 255))),
                 Span::raw(v.as_str()),
             ])
         })
@@ -1213,7 +1235,8 @@ fn render_sysinfo(frame: &mut Frame, area: Rect) {
         Block::default()
             .title(" System Info ")
             .borders(Borders::ALL)
-            .border_style(Style::default().fg(Color::Magenta)),
+            .border_type(BorderType::Rounded)
+            .border_style(Style::default().fg(Color::Rgb(180, 100, 255))),
     );
 
     frame.render_widget(table, area);
@@ -1251,7 +1274,8 @@ fn render_memory(frame: &mut Frame, app: &App, area: Rect) {
     let block = Block::default()
         .title(" Memory ")
         .borders(Borders::ALL)
-        .border_style(Style::default().fg(Color::Green));
+        .border_type(BorderType::Rounded)
+        .border_style(Style::default().fg(Color::Rgb(140, 160, 255)));
     frame.render_widget(block, area);
 
     let mem_label = Paragraph::new(format!(
@@ -1266,11 +1290,11 @@ fn render_memory(frame: &mut Frame, app: &App, area: Rect) {
         .gauge_style(
             Style::default()
                 .fg(if mem_pct > 0.85 {
-                    Color::Red
+                    Color::Rgb(255, 100, 100)
                 } else {
-                    Color::Green
+                    Color::Rgb(140, 160, 255)
                 })
-                .bg(Color::DarkGray),
+                .bg(Color::Rgb(30, 30, 50)),
         )
         .ratio(mem_pct.min(1.0))
         .label(format!("{:.0}%", mem_pct * 100.0));
@@ -1288,11 +1312,11 @@ fn render_memory(frame: &mut Frame, app: &App, area: Rect) {
         .gauge_style(
             Style::default()
                 .fg(if swap_pct > 0.5 {
-                    Color::Red
+                    Color::Rgb(255, 100, 100)
                 } else {
-                    Color::Yellow
+                    Color::Rgb(180, 100, 255)
                 })
-                .bg(Color::DarkGray),
+                .bg(Color::Rgb(30, 30, 50)),
         )
         .ratio(swap_pct.min(1.0))
         .label(format!("{:.0}%", swap_pct * 100.0));
@@ -1302,7 +1326,7 @@ fn render_memory(frame: &mut Frame, app: &App, area: Rect) {
     let spark = Sparkline::default()
         .data(&data)
         .max(100)
-        .style(Style::default().fg(Color::Green));
+        .style(Style::default().fg(Color::Rgb(140, 160, 255)));
     frame.render_widget(spark, inner[4]);
 }
 
@@ -1320,16 +1344,17 @@ fn render_network(frame: &mut Frame, app: &App, area: Rect) {
     let block = Block::default()
         .title(" Network ")
         .borders(Borders::ALL)
-        .border_style(Style::default().fg(Color::Blue));
+        .border_type(BorderType::Rounded)
+        .border_style(Style::default().fg(Color::Rgb(100, 120, 220)));
     frame.render_widget(block, area);
 
     let net_info = Paragraph::new(vec![
         Line::from(vec![
-            Span::styled("RX: ", Style::default().fg(Color::Green)),
+            Span::styled("RX: ", Style::default().fg(Color::Rgb(140, 160, 255))),
             Span::raw(format_bytes(app.net_rx_rate)),
         ]),
         Line::from(vec![
-            Span::styled("TX: ", Style::default().fg(Color::Red)),
+            Span::styled("TX: ", Style::default().fg(Color::Rgb(180, 100, 255))),
             Span::raw(format_bytes(app.net_tx_rate)),
         ]),
     ]);
@@ -1338,13 +1363,13 @@ fn render_network(frame: &mut Frame, app: &App, area: Rect) {
     let rx_data: Vec<u64> = app.net_rx_history.iter().copied().collect();
     let spark_rx = Sparkline::default()
         .data(&rx_data)
-        .style(Style::default().fg(Color::Green));
+        .style(Style::default().fg(Color::Rgb(140, 160, 255)));
     frame.render_widget(spark_rx, inner[1]);
 
     let tx_data: Vec<u64> = app.net_tx_history.iter().copied().collect();
     let spark_tx = Sparkline::default()
         .data(&tx_data)
-        .style(Style::default().fg(Color::Red));
+        .style(Style::default().fg(Color::Rgb(180, 100, 255)));
     frame.render_widget(spark_tx, inner[2]);
 }
 
@@ -1362,16 +1387,17 @@ fn render_disk(frame: &mut Frame, app: &App, area: Rect) {
     let block = Block::default()
         .title(" Disk I/O ")
         .borders(Borders::ALL)
-        .border_style(Style::default().fg(Color::Yellow));
+        .border_type(BorderType::Rounded)
+        .border_style(Style::default().fg(Color::Rgb(180, 100, 255)));
     frame.render_widget(block, area);
 
     let disk_info = Paragraph::new(vec![
         Line::from(vec![
-            Span::styled("Read:  ", Style::default().fg(Color::Green)),
+            Span::styled("Read:  ", Style::default().fg(Color::Rgb(140, 160, 255))),
             Span::raw(format_bytes(app.disk_read_rate)),
         ]),
         Line::from(vec![
-            Span::styled("Write: ", Style::default().fg(Color::Red)),
+            Span::styled("Write: ", Style::default().fg(Color::Rgb(180, 100, 255))),
             Span::raw(format_bytes(app.disk_write_rate)),
         ]),
     ]);
@@ -1380,13 +1406,13 @@ fn render_disk(frame: &mut Frame, app: &App, area: Rect) {
     let read_data: Vec<u64> = app.disk_read_history.iter().copied().collect();
     let spark_read = Sparkline::default()
         .data(&read_data)
-        .style(Style::default().fg(Color::Green));
+        .style(Style::default().fg(Color::Rgb(140, 160, 255)));
     frame.render_widget(spark_read, inner[1]);
 
     let write_data: Vec<u64> = app.disk_write_history.iter().copied().collect();
     let spark_write = Sparkline::default()
         .data(&write_data)
-        .style(Style::default().fg(Color::Red));
+        .style(Style::default().fg(Color::Rgb(180, 100, 255)));
     frame.render_widget(spark_write, inner[2]);
 }
 
@@ -1418,11 +1444,13 @@ fn render_processes(frame: &mut Frame, app: &App, area: Rect) {
         SortMode::Memory => procs.sort_by(|a, b| b.3.cmp(&a.3)),
         SortMode::Pid => procs.sort_by(|a, b| a.0.as_u32().cmp(&b.0.as_u32())),
     }
-    procs.truncate(15);
+    let max_rows = area.height.saturating_sub(4) as usize;
+    procs.truncate(max_rows);
 
     let rows: Vec<Row> = procs
         .iter()
-        .map(|(pid, name, cpu, mem)| {
+        .enumerate()
+        .map(|(i, (pid, name, cpu, mem))| {
             let cpu_color = if *cpu > 80.0 {
                 Color::Red
             } else if *cpu > 40.0 {
@@ -1430,7 +1458,7 @@ fn render_processes(frame: &mut Frame, app: &App, area: Rect) {
             } else {
                 Color::White
             };
-            Row::new(vec![
+            let row = Row::new(vec![
                 Span::styled(format!("{}", pid), Style::default().fg(Color::DarkGray)),
                 Span::raw(if name.chars().count() > 20 {
                     format!("{}...", name.chars().take(17).collect::<String>())
@@ -1439,14 +1467,19 @@ fn render_processes(frame: &mut Frame, app: &App, area: Rect) {
                 }),
                 Span::styled(format!("{:.1}%", cpu), Style::default().fg(cpu_color)),
                 Span::raw(format!("{:.1} MB", *mem as f64 / 1_048_576.0)),
-            ])
+            ]);
+            if i % 2 == 1 {
+                row.style(Style::default().bg(Color::Rgb(22, 24, 40)))
+            } else {
+                row
+            }
         })
         .collect();
 
     let header = Row::new(vec!["PID", "Process", "CPU", "Memory"])
         .style(
             Style::default()
-                .fg(Color::Cyan)
+                .fg(Color::Rgb(220, 220, 235))
                 .add_modifier(Modifier::BOLD),
         )
         .bottom_margin(1);
@@ -1466,8 +1499,10 @@ fn render_processes(frame: &mut Frame, app: &App, area: Rect) {
     .block(
         Block::default()
             .title(title)
+            .title_bottom(Line::from(" Tab: full view ").right_aligned())
             .borders(Borders::ALL)
-            .border_style(Style::default().fg(Color::Red)),
+            .border_type(BorderType::Rounded)
+            .border_style(Style::default().fg(Color::Rgb(100, 120, 220))),
     );
 
     frame.render_widget(table, area);
@@ -1526,7 +1561,8 @@ fn render_processes_full(frame: &mut Frame, app: &App, area: Rect) {
 
     let rows: Vec<Row> = visible_procs
         .iter()
-        .map(|(pid, name, cpu, mem)| {
+        .enumerate()
+        .map(|(i, (pid, name, cpu, mem))| {
             let cpu_color = if *cpu > 80.0 {
                 Color::Red
             } else if *cpu > 40.0 {
@@ -1534,7 +1570,7 @@ fn render_processes_full(frame: &mut Frame, app: &App, area: Rect) {
             } else {
                 Color::White
             };
-            Row::new(vec![
+            let row = Row::new(vec![
                 Span::styled(format!("{}", pid), Style::default().fg(Color::DarkGray)),
                 Span::raw(if name.chars().count() > 30 {
                     format!("{}...", name.chars().take(27).collect::<String>())
@@ -1543,14 +1579,19 @@ fn render_processes_full(frame: &mut Frame, app: &App, area: Rect) {
                 }),
                 Span::styled(format!("{:.1}%", cpu), Style::default().fg(cpu_color)),
                 Span::raw(format!("{:.1} MB", *mem as f64 / 1_048_576.0)),
-            ])
+            ]);
+            if i % 2 == 1 {
+                row.style(Style::default().bg(Color::Rgb(22, 24, 40)))
+            } else {
+                row
+            }
         })
         .collect();
 
     let header = Row::new(vec!["PID", "Process", "CPU", "Memory"])
         .style(
             Style::default()
-                .fg(Color::Cyan)
+                .fg(Color::Rgb(220, 220, 235))
                 .add_modifier(Modifier::BOLD),
         )
         .bottom_margin(1);
@@ -1561,6 +1602,8 @@ fn render_processes_full(frame: &mut Frame, app: &App, area: Rect) {
         if procs.is_empty() { 0 } else { scroll + 1 },
         procs.len()
     );
+
+    let scroll_label = format!(" {}/{} ", scroll + 1, procs.len());
 
     let table = Table::new(
         rows,
@@ -1575,8 +1618,10 @@ fn render_processes_full(frame: &mut Frame, app: &App, area: Rect) {
     .block(
         Block::default()
             .title(title)
+            .title_bottom(Line::from(scroll_label).right_aligned())
             .borders(Borders::ALL)
-            .border_style(Style::default().fg(Color::Red)),
+            .border_type(BorderType::Rounded)
+            .border_style(Style::default().fg(Color::Rgb(100, 120, 220))),
     );
 
     frame.render_widget(table, table_area);
@@ -1597,7 +1642,7 @@ fn render_processes_full(frame: &mut Frame, app: &App, area: Rect) {
     }
 }
 
-/// CPU Detail tab: per-core sparklines
+/// CPU Detail tab: per-core sparklines with two-column layout when needed
 fn render_cpu_sparklines(frame: &mut Frame, app: &App, area: Rect) {
     let cpu_count = app.cpu_history.len();
     if cpu_count == 0 {
@@ -1614,46 +1659,91 @@ fn render_cpu_sparklines(frame: &mut Frame, app: &App, area: Rect) {
     let block = Block::default()
         .title(title)
         .borders(Borders::ALL)
-        .border_style(Style::default().fg(Color::Cyan));
+        .border_type(BorderType::Rounded)
+        .border_style(Style::default().fg(Color::Rgb(100, 120, 220)));
     let inner = block.inner(area);
     frame.render_widget(block, area);
 
-    // Each core: 1 row for label+sparkline
-    let mut constraints: Vec<Constraint> = (0..cpu_count).map(|_| Constraint::Length(1)).collect();
-    constraints.push(Constraint::Min(0));
-    let rows = Layout::default()
-        .direction(Direction::Vertical)
-        .constraints(constraints)
-        .split(inner);
+    let available_rows = inner.height as usize;
+    let use_two_cols = cpu_count > available_rows;
 
-    for (i, hist) in app.cpu_history.iter().enumerate() {
-        if i >= rows.len().saturating_sub(1) {
-            break;
-        }
-        let data: Vec<u64> = hist.iter().copied().collect();
-        let current = data.last().copied().unwrap_or(0);
-        let color = if current > 90 {
-            Color::Red
-        } else if current > 60 {
-            Color::Yellow
-        } else {
-            Color::Green
-        };
-
-        let row_chunks = Layout::default()
+    if use_two_cols {
+        // Split into two columns
+        let col_chunks = Layout::default()
             .direction(Direction::Horizontal)
-            .constraints([Constraint::Length(12), Constraint::Min(1)])
-            .split(rows[i]);
+            .constraints([Constraint::Percentage(50), Constraint::Percentage(50)])
+            .split(inner);
 
-        let label = Paragraph::new(format!(" Core {:>2} {:>3}%", i, current))
-            .style(Style::default().fg(color));
-        frame.render_widget(label, row_chunks[0]);
+        let half = (cpu_count + 1) / 2;
+        for (col_idx, col_area) in col_chunks.iter().enumerate() {
+            let start = col_idx * half;
+            let end = (start + half).min(cpu_count);
+            let col_count = end - start;
+            let mut constraints: Vec<Constraint> =
+                (0..col_count).map(|_| Constraint::Length(1)).collect();
+            constraints.push(Constraint::Min(0));
+            let rows = Layout::default()
+                .direction(Direction::Vertical)
+                .constraints(constraints)
+                .split(*col_area);
 
-        let spark = Sparkline::default()
-            .data(&data)
-            .max(100)
-            .style(Style::default().fg(color));
-        frame.render_widget(spark, row_chunks[1]);
+            for (ri, i) in (start..end).enumerate() {
+                if ri >= rows.len().saturating_sub(1) {
+                    break;
+                }
+                let data: Vec<u64> = app.cpu_history[i].iter().copied().collect();
+                let current = data.last().copied().unwrap_or(0);
+                let color = cpu_gradient(current);
+
+                let row_chunks = Layout::default()
+                    .direction(Direction::Horizontal)
+                    .constraints([Constraint::Length(12), Constraint::Min(1)])
+                    .split(rows[ri]);
+
+                let label = Paragraph::new(format!(" Core {:>2} {:>3}%", i, current))
+                    .style(Style::default().fg(color));
+                frame.render_widget(label, row_chunks[0]);
+
+                let spark = Sparkline::default()
+                    .data(&data)
+                    .max(100)
+                    .style(Style::default().fg(color));
+                frame.render_widget(spark, row_chunks[1]);
+            }
+        }
+    } else {
+        // Single column: each core gets 1 row
+        let mut constraints: Vec<Constraint> =
+            (0..cpu_count).map(|_| Constraint::Length(1)).collect();
+        constraints.push(Constraint::Min(0));
+        let rows = Layout::default()
+            .direction(Direction::Vertical)
+            .constraints(constraints)
+            .split(inner);
+
+        for (i, hist) in app.cpu_history.iter().enumerate() {
+            if i >= rows.len().saturating_sub(1) {
+                break;
+            }
+            let data: Vec<u64> = hist.iter().copied().collect();
+            let current = data.last().copied().unwrap_or(0);
+            let color = cpu_gradient(current);
+
+            let row_chunks = Layout::default()
+                .direction(Direction::Horizontal)
+                .constraints([Constraint::Length(12), Constraint::Min(1)])
+                .split(rows[i]);
+
+            let label = Paragraph::new(format!(" Core {:>2} {:>3}%", i, current))
+                .style(Style::default().fg(color));
+            frame.render_widget(label, row_chunks[0]);
+
+            let spark = Sparkline::default()
+                .data(&data)
+                .max(100)
+                .style(Style::default().fg(color));
+            frame.render_widget(spark, row_chunks[1]);
+        }
     }
 }
 
@@ -1672,69 +1762,69 @@ fn render_help_overlay(frame: &mut Frame) {
         Line::from(Span::styled(
             " Peppemon Keybindings",
             Style::default()
-                .fg(Color::Cyan)
+                .fg(Color::Rgb(180, 100, 255))
                 .add_modifier(Modifier::BOLD),
         )),
         Line::from(""),
         Line::from(vec![
-            Span::styled("  Tab      ", Style::default().fg(Color::Yellow)),
+            Span::styled("  Tab      ", Style::default().fg(Color::Rgb(140, 160, 255))),
             Span::raw("Cycle tabs"),
         ]),
         Line::from(vec![
-            Span::styled("  q        ", Style::default().fg(Color::Yellow)),
+            Span::styled("  q        ", Style::default().fg(Color::Rgb(140, 160, 255))),
             Span::raw("Quit"),
         ]),
         Line::from(vec![
-            Span::styled("  ?        ", Style::default().fg(Color::Yellow)),
+            Span::styled("  ?        ", Style::default().fg(Color::Rgb(140, 160, 255))),
             Span::raw("Toggle this help"),
         ]),
         Line::from(vec![
-            Span::styled("  /        ", Style::default().fg(Color::Yellow)),
+            Span::styled("  /        ", Style::default().fg(Color::Rgb(140, 160, 255))),
             Span::raw("Filter processes"),
         ]),
         Line::from(vec![
-            Span::styled("  Esc      ", Style::default().fg(Color::Yellow)),
+            Span::styled("  Esc      ", Style::default().fg(Color::Rgb(140, 160, 255))),
             Span::raw("Close filter / quit"),
         ]),
         Line::from(""),
         Line::from(Span::styled(
             " Sort",
             Style::default()
-                .fg(Color::Cyan)
+                .fg(Color::Rgb(180, 100, 255))
                 .add_modifier(Modifier::BOLD),
         )),
         Line::from(vec![
-            Span::styled("  c        ", Style::default().fg(Color::Yellow)),
+            Span::styled("  c        ", Style::default().fg(Color::Rgb(140, 160, 255))),
             Span::raw("Sort by CPU"),
         ]),
         Line::from(vec![
-            Span::styled("  m        ", Style::default().fg(Color::Yellow)),
+            Span::styled("  m        ", Style::default().fg(Color::Rgb(140, 160, 255))),
             Span::raw("Sort by Memory"),
         ]),
         Line::from(vec![
-            Span::styled("  p        ", Style::default().fg(Color::Yellow)),
+            Span::styled("  p        ", Style::default().fg(Color::Rgb(140, 160, 255))),
             Span::raw("Sort by PID"),
         ]),
         Line::from(""),
         Line::from(Span::styled(
             " Navigation",
             Style::default()
-                .fg(Color::Cyan)
+                .fg(Color::Rgb(180, 100, 255))
                 .add_modifier(Modifier::BOLD),
         )),
         Line::from(vec![
-            Span::styled("  Up/Down  ", Style::default().fg(Color::Yellow)),
+            Span::styled("  Up/Down  ", Style::default().fg(Color::Rgb(140, 160, 255))),
             Span::raw("Scroll process list"),
         ]),
         Line::from(""),
         Line::from(Span::styled(
             " Background",
             Style::default()
-                .fg(Color::Cyan)
+                .fg(Color::Rgb(180, 100, 255))
                 .add_modifier(Modifier::BOLD),
         )),
         Line::from(vec![
-            Span::styled("  b        ", Style::default().fg(Color::Yellow)),
+            Span::styled("  b        ", Style::default().fg(Color::Rgb(140, 160, 255))),
             Span::raw("Background effects settings"),
         ]),
     ];
@@ -1743,7 +1833,8 @@ fn render_help_overlay(frame: &mut Frame) {
         Block::default()
             .title(" Help ")
             .borders(Borders::ALL)
-            .border_style(Style::default().fg(Color::Cyan)),
+            .border_type(BorderType::Rounded)
+            .border_style(Style::default().fg(Color::Rgb(180, 100, 255))),
     );
     frame.render_widget(help, popup);
 }
@@ -1751,7 +1842,7 @@ fn render_help_overlay(frame: &mut Frame) {
 /// Settings overlay: centered popup for background effect controls
 fn render_settings_overlay(frame: &mut Frame, app: &App) {
     let area = frame.area();
-    let popup_w = 46u16.min(area.width.saturating_sub(4));
+    let popup_w = 54u16.min(area.width.saturating_sub(4));
     let popup_h = 12u16.min(area.height.saturating_sub(4));
     let x = (area.width.saturating_sub(popup_w)) / 2;
     let y = (area.height.saturating_sub(popup_h)) / 2;
@@ -1783,9 +1874,9 @@ fn render_settings_overlay(frame: &mut Frame, app: &App) {
         int
     );
     let speed_bar = format!(
-        "{}{} ({}/3)",
+        "{}{} ({}/10)",
         "\u{2588}".repeat(spd),
-        "\u{2591}".repeat(3 - spd),
+        "\u{2591}".repeat(10 - spd),
         spd
     );
 
@@ -1809,7 +1900,7 @@ fn render_settings_overlay(frame: &mut Frame, app: &App) {
         Line::from(Span::styled(
             " Background Effects",
             Style::default()
-                .fg(Color::Cyan)
+                .fg(Color::Rgb(180, 100, 255))
                 .add_modifier(Modifier::BOLD),
         )),
         Line::from(""),
@@ -1820,10 +1911,10 @@ fn render_settings_overlay(frame: &mut Frame, app: &App) {
         let (indicator, style) = if selected {
             (
                 "\u{25b6} ",
-                Style::default().fg(Color::Yellow),
+                Style::default().fg(Color::Rgb(140, 160, 255)),
             )
         } else {
-            ("  ", Style::default().fg(Color::White))
+            ("  ", Style::default().fg(Color::Rgb(220, 220, 235)))
         };
         lines.push(Line::from(vec![
             Span::styled(indicator, style),
@@ -1835,14 +1926,15 @@ fn render_settings_overlay(frame: &mut Frame, app: &App) {
     lines.push(Line::from(""));
     lines.push(Line::from(Span::styled(
         "  \u{2190}/\u{2192} change  \u{2191}/\u{2193} navigate  Esc close",
-        Style::default().fg(Color::DarkGray),
+        Style::default().fg(Color::Rgb(100, 105, 130)),
     )));
 
     let settings = Paragraph::new(lines).block(
         Block::default()
             .title(" Settings ")
             .borders(Borders::ALL)
-            .border_style(Style::default().fg(Color::Yellow)),
+            .border_type(BorderType::Rounded)
+            .border_style(Style::default().fg(Color::Rgb(180, 100, 255))),
     );
     frame.render_widget(settings, popup);
 }
@@ -1866,7 +1958,7 @@ fn settings_change(ps: &mut ParticleSystem, row: SettingsRow, right: bool) {
                 }
             };
             ps.particles.clear();
-            ps.transition_cooldown = 5;
+            ps.transition_cooldown = 30;
             ps.cycle_timer = Instant::now();
         }
         SettingsRow::CycleMode => {
@@ -1901,7 +1993,7 @@ fn settings_change(ps: &mut ParticleSystem, row: SettingsRow, right: bool) {
         }
         SettingsRow::Speed => {
             if right {
-                ps.speed = (ps.speed + 1).min(3);
+                ps.speed = (ps.speed + 1).min(10);
             } else {
                 ps.speed = ps.speed.saturating_sub(1).max(1);
             }
@@ -1934,17 +2026,21 @@ fn render_status_bar(frame: &mut Frame, app: &App, area: Rect) {
         let status = Paragraph::new(Line::from(vec![
             Span::styled(
                 " peppemon ",
-                Style::default().fg(Color::Black).bg(Color::Cyan),
+                Style::default()
+                    .fg(Color::Rgb(220, 220, 235))
+                    .bg(Color::Rgb(100, 120, 220)),
             ),
             Span::raw("  "),
             Span::styled(
                 format!(" {} ", tab_name),
-                Style::default().fg(Color::Black).bg(Color::Magenta),
+                Style::default()
+                    .fg(Color::Rgb(220, 220, 235))
+                    .bg(Color::Rgb(180, 100, 255)),
             ),
             Span::raw(format!("  sort: {}  ", sort_label(app.sort_mode))),
             Span::styled(
                 format!(" {} cpus ", app.sys.cpus().len()),
-                Style::default().fg(Color::DarkGray),
+                Style::default().fg(Color::Rgb(100, 105, 130)),
             ),
             Span::raw("  "),
             Span::styled(
@@ -1957,11 +2053,13 @@ fn render_status_bar(frame: &mut Frame, app: &App, area: Rect) {
                         WeatherEffect::Seasons => "Seasons",
                     }
                 ),
-                Style::default().fg(Color::Black).bg(Color::Blue),
+                Style::default()
+                    .fg(Color::Rgb(220, 220, 235))
+                    .bg(Color::Rgb(60, 70, 140)),
             ),
             Span::styled(
                 "  ?: help  b: effects ",
-                Style::default().fg(Color::DarkGray),
+                Style::default().fg(Color::Rgb(100, 105, 130)),
             ),
         ]));
         frame.render_widget(status, area);
@@ -2065,10 +2163,11 @@ fn main() -> io::Result<()> {
             }
         }
 
-        // Animation tick (10 FPS)
+        // Animation tick (30 FPS)
         if last_anim.elapsed() >= ANIM_TICK {
+            let dt = last_anim.elapsed().as_secs_f32().min(0.15);
             let size = terminal.size()?;
-            app.particles.update(size.width, size.height);
+            app.particles.update(size.width, size.height, dt);
             last_anim = Instant::now();
         }
 
