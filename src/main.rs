@@ -981,7 +981,7 @@ fn render_clock(frame: &mut Frame) {
     }
 
     let ox = (area.width - total_w) / 2;
-    let oy = (area.height - total_h) / 2;
+    let oy = 1;
     let fg_color = Color::Rgb(70, 80, 130);
     let bg_color = Color::Rgb(22, 24, 40);
 
